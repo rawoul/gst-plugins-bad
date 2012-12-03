@@ -1317,8 +1317,8 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux, gboolean caching)
 {
   GstFragment *download;
   const gchar *next_fragment_uri;
-  GstClockTime duration;
-  GstClockTime timestamp;
+  GstClockTime duration, timestamp;
+  gint64 offset, length;
   GstBufferList *buffer_list;
   GstBuffer *buf;
   gboolean discont;
@@ -1326,7 +1326,8 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux, gboolean caching)
   const guint8 *iv = NULL;
 
   if (!gst_m3u8_client_get_next_fragment (demux->client, &discont,
-          &next_fragment_uri, &duration, &timestamp, &key, &iv)) {
+          &next_fragment_uri, &duration, &timestamp, &offset, &length,
+          &key, &iv)) {
     GST_INFO_OBJECT (demux, "This playlist doesn't contain more fragments");
     demux->end_of_playlist = TRUE;
     gst_task_start (demux->stream_task);
@@ -1335,8 +1336,8 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux, gboolean caching)
 
   GST_INFO_OBJECT (demux, "Fetching next fragment %s", next_fragment_uri);
 
-  download = gst_uri_downloader_fetch_uri (demux->downloader,
-      next_fragment_uri);
+  download = gst_uri_downloader_fetch_uri_with_range (demux->downloader,
+      next_fragment_uri, offset, offset + length);
 
   if (download && key)
     download = gst_hls_demux_decrypt_fragment (demux, download, key, iv);

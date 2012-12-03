@@ -36,7 +36,8 @@ static void gst_m3u8_free (GstM3U8 * m3u8);
 static gboolean gst_m3u8_update (GstM3U8 * m3u8, gchar * data,
     gboolean * updated);
 static GstM3U8MediaFile *gst_m3u8_media_file_new (gchar * uri,
-    gchar * title, GstClockTime duration, guint sequence);
+    gchar * title, GstClockTime duration, guint sequence, gint64 offset,
+    gint64 length);
 static void gst_m3u8_media_file_free (GstM3U8MediaFile * self);
 gchar *uri_join (const gchar * uri, const gchar * path);
 
@@ -81,8 +82,8 @@ gst_m3u8_free (GstM3U8 * self)
 }
 
 static GstM3U8MediaFile *
-gst_m3u8_media_file_new (gchar * uri, gchar * title, GstClockTime duration,
-    guint sequence)
+gst_m3u8_media_file_new (gchar * uri, gchar * title,
+    GstClockTime duration, guint sequence, gint64 offset, gint64 length)
 {
   GstM3U8MediaFile *file;
 
@@ -91,6 +92,8 @@ gst_m3u8_media_file_new (gchar * uri, gchar * title, GstClockTime duration,
   file->title = title;
   file->duration = duration;
   file->sequence = sequence;
+  file->offset = offset;
+  file->length = length;
 
   return file;
 }
@@ -107,31 +110,37 @@ gst_m3u8_media_file_free (GstM3U8MediaFile * self)
 }
 
 static gboolean
-int_from_string (gchar * ptr, gchar ** endptr, gint * val)
+int64_from_string (gchar * ptr, gchar ** endptr, gint64 * val)
 {
   gchar *end;
-  glong ret;
 
-  g_return_val_if_fail (ptr != NULL, FALSE);
-  g_return_val_if_fail (val != NULL, FALSE);
-
-  errno = 0;
-  ret = strtol (ptr, &end, 10);
-  if ((errno == ERANGE && (ret == LONG_MAX || ret == LONG_MIN))
-      || (errno != 0 && ret == 0)) {
-    GST_WARNING ("%s", g_strerror (errno));
-    return FALSE;
-  }
-
-  if (ret > G_MAXINT) {
-    GST_WARNING ("%s", g_strerror (ERANGE));
-    return FALSE;
-  }
-
+  *val = g_ascii_strtoll (ptr, &end, 0);
   if (endptr)
     *endptr = end;
 
-  *val = (gint) ret;
+  if (errno != 0)
+    return FALSE;
+
+  return end != ptr;
+}
+
+static gboolean
+int_from_string (gchar * ptr, gchar ** endptr, gint * val)
+{
+  gchar *end;
+  gint64 v;
+
+  v = g_ascii_strtoll (ptr, &end, 0);
+  if (endptr)
+    *endptr = end;
+
+  *val = v;
+
+  if (errno != 0)
+    return FALSE;
+
+  if (v > G_MAXINT || v < G_MININT)
+    return FALSE;
 
   return end != ptr;
 }
@@ -226,6 +235,7 @@ gst_m3u8_update (GstM3U8 * self, gchar * data, gboolean * updated)
   gchar *title, *end;
 //  gboolean discontinuity;
   GstM3U8 *list;
+  gint64 offset, length, acc_offset;
 
   g_return_val_if_fail (self != NULL, FALSE);
   g_return_val_if_fail (data != NULL, FALSE);
@@ -261,6 +271,10 @@ gst_m3u8_update (GstM3U8 * self, gchar * data, gboolean * updated)
   duration = 0;
   title = NULL;
   data += 7;
+  acc_offset = 0;
+  offset = 0;
+  length = -1;
+
   while (TRUE) {
     end = g_utf8_strchr (data, -1, '\n');
     if (end)
@@ -297,7 +311,7 @@ gst_m3u8_update (GstM3U8 * self, gchar * data, gboolean * updated)
         GstM3U8MediaFile *file;
         file =
             gst_m3u8_media_file_new (data, title, duration,
-            self->mediasequence++);
+            self->mediasequence++, offset, length);
 
         /* set encryption params */
         file->key = g_strdup (self->key);
@@ -308,6 +322,8 @@ gst_m3u8_update (GstM3U8 * self, gchar * data, gboolean * updated)
 
         duration = 0;
         title = NULL;
+        offset = 0;
+        length = -1;
         self->files = g_list_append (self->files, file);
       }
 
@@ -397,6 +413,23 @@ gst_m3u8_update (GstM3U8 * self, gchar * data, gboolean * updated)
       if (data != end) {
         g_free (title);
         title = g_strdup (data);
+      }
+    } else if (g_str_has_prefix (data, "#EXT-X-BYTERANGE:")) {
+      gchar **content;
+      guint size;
+
+      content = g_strsplit (data + 17, "@", 2);
+      size = sizeof (content) / sizeof (gchar *);
+      if (!int64_from_string (content[0], NULL, &length)) {
+        GST_WARNING ("Error while reading the lenght in #EXT-X-BYTERANGE");
+      }
+      if (size == 2) {
+        if (!int64_from_string (content[0], NULL, &offset)) {
+          GST_WARNING ("Error while reading the offset in #EXT-X-BYTERANGE");
+        }
+      } else {
+        offset = acc_offset;
+        acc_offset += length;
       }
     } else {
       GST_LOG ("Ignored line: %s", data);
@@ -546,7 +579,8 @@ gst_m3u8_client_get_current_position (GstM3U8Client * client,
 gboolean
 gst_m3u8_client_get_next_fragment (GstM3U8Client * client,
     gboolean * discontinuity, const gchar ** uri, GstClockTime * duration,
-    GstClockTime * timestamp, const gchar ** key, const guint8 ** iv)
+    GstClockTime * timestamp, gint64 * offset, gint64 * length,
+    const gchar ** key, const guint8 ** iv)
 {
   GList *l;
   GstM3U8MediaFile *file;
@@ -573,6 +607,8 @@ gst_m3u8_client_get_next_fragment (GstM3U8Client * client,
 
   *uri = file->uri;
   *duration = file->duration;
+  *offset = file->offset;
+  *length = file->length;
   *key = file->key;
   *iv = file->iv;
 

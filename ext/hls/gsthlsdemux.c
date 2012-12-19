@@ -736,8 +736,7 @@ gst_hls_demux_stream_loop (GstHLSDemux * demux)
   if (G_LIKELY (demux->srcpad))
     srccaps = gst_pad_get_current_caps (demux->srcpad);
   bufcaps = gst_fragment_get_caps (fragment);
-  if (G_UNLIKELY (!srccaps || !gst_caps_is_equal_fixed (bufcaps, srccaps)
-          || demux->need_segment)) {
+  if (G_UNLIKELY (!srccaps || !gst_caps_is_equal_fixed (bufcaps, srccaps))) {
     switch_pads (demux, bufcaps);
     demux->need_segment = TRUE;
   }

@@ -59,8 +59,7 @@ enum
 {
   PROP_0,
   PROP_ENABLE,
-  PROP_EMBEDDEDFONTS,
-  PROP_WAIT_TEXT
+  PROP_EMBEDDEDFONTS
 };
 
 /* FIXME: video-blend.c doesn't support formats with more than 8 bit per
@@ -91,12 +90,8 @@ static GstStaticPadTemplate text_sink_factory =
     );
 
 #define GST_ASS_RENDER_GET_LOCK(ass) (&GST_ASS_RENDER (ass)->lock)
-#define GST_ASS_RENDER_GET_COND(ass) (&GST_ASS_RENDER (ass)->cond)
 #define GST_ASS_RENDER_LOCK(ass)     (g_mutex_lock (GST_ASS_RENDER_GET_LOCK (ass)))
 #define GST_ASS_RENDER_UNLOCK(ass)   (g_mutex_unlock (GST_ASS_RENDER_GET_LOCK (ass)))
-#define GST_ASS_RENDER_WAIT(ass)     (g_cond_wait (GST_ASS_RENDER_GET_COND (ass), GST_ASS_RENDER_GET_LOCK (ass)))
-#define GST_ASS_RENDER_SIGNAL(ass)   (g_cond_signal (GST_ASS_RENDER_GET_COND (ass)))
-#define GST_ASS_RENDER_BROADCAST(ass)(g_cond_broadcast (GST_ASS_RENDER_GET_COND (ass)))
 
 static void gst_ass_render_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
@@ -152,11 +147,6 @@ gst_ass_render_class_init (GstAssRenderClass * klass)
   g_object_class_install_property (gobject_class, PROP_EMBEDDEDFONTS,
       g_param_spec_boolean ("embeddedfonts", "Embedded Fonts",
           "Extract and use fonts embedded in the stream", TRUE,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-  g_object_class_install_property (gobject_class, PROP_WAIT_TEXT,
-      g_param_spec_boolean ("wait-text", "Wait Text",
-          "Whether to wait for subtitles", TRUE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gstelement_class->change_state =
@@ -235,13 +225,11 @@ gst_ass_render_init (GstAssRender * render)
   gst_video_info_init (&render->info);
 
   g_mutex_init (&render->lock);
-  g_cond_init (&render->cond);
 
   render->renderer_init_ok = FALSE;
   render->track_init_ok = FALSE;
   render->enable = TRUE;
   render->embeddedfonts = TRUE;
-  render->wait_text = FALSE;
 
   gst_segment_init (&render->video_segment, GST_FORMAT_TIME);
   gst_segment_init (&render->subtitle_segment, GST_FORMAT_TIME);
@@ -270,7 +258,6 @@ gst_ass_render_finalize (GObject * object)
   GstAssRender *render = GST_ASS_RENDER (object);
 
   g_mutex_clear (&render->lock);
-  g_cond_clear (&render->cond);
 
   if (render->ass_track) {
     ass_free_track (render->ass_track);
@@ -306,9 +293,6 @@ gst_ass_render_set_property (GObject * object, guint prop_id,
       ass_set_extract_fonts (render->ass_library, render->embeddedfonts);
       g_mutex_unlock (&render->ass_mutex);
       break;
-    case PROP_WAIT_TEXT:
-      render->wait_text = g_value_get_boolean (value);
-      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -330,29 +314,11 @@ gst_ass_render_get_property (GObject * object, guint prop_id,
     case PROP_EMBEDDEDFONTS:
       g_value_set_boolean (value, render->embeddedfonts);
       break;
-    case PROP_WAIT_TEXT:
-      g_value_set_boolean (value, render->wait_text);
-      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
   }
   GST_ASS_RENDER_UNLOCK (render);
-}
-
-/* Called with lock held */
-static void
-gst_ass_render_pop_text (GstAssRender * render)
-{
-  if (render->subtitle_pending) {
-    GST_DEBUG_OBJECT (render, "releasing text buffer %p",
-        render->subtitle_pending);
-    gst_buffer_unref (render->subtitle_pending);
-    render->subtitle_pending = NULL;
-  }
-
-  /* Let the text task know we used that buffer */
-  GST_ASS_RENDER_BROADCAST (render);
 }
 
 static GstStateChangeReturn
@@ -366,7 +332,6 @@ gst_ass_render_change_state (GstElement * element, GstStateChange transition)
       GST_ASS_RENDER_LOCK (render);
       render->subtitle_flushing = TRUE;
       render->video_flushing = TRUE;
-      gst_ass_render_pop_text (render);
       GST_ASS_RENDER_UNLOCK (render);
       break;
     default:
@@ -464,7 +429,6 @@ gst_ass_render_event_src (GstPad * pad, GstObject * parent, GstEvent * event)
       GST_ASS_RENDER_LOCK (render);
       render->subtitle_flushing = TRUE;
       render->video_flushing = TRUE;
-      gst_ass_render_pop_text (render);
       GST_ASS_RENDER_UNLOCK (render);
 
       /* Seek on each sink pad */
@@ -716,30 +680,30 @@ gst_ass_render_setcaps_text (GstPad * pad, GstCaps * caps)
 
 
 static void
-gst_ass_render_process_text (GstAssRender * render, GstBuffer * buffer,
-    GstClockTime running_time, GstClockTime duration)
+gst_ass_render_process_text (GstAssRender * render, GstBuffer * buffer)
 {
-  GstMapInfo map;
   gdouble pts_start, pts_end;
+  GstMapInfo map;
 
-  pts_start = running_time;
-  pts_start /= GST_MSECOND;
-  pts_end = duration;
-  pts_end /= GST_MSECOND;
+  GST_DEBUG_OBJECT (render, "Processing text buffer %" GST_PTR_FORMAT, buffer);
 
-  GST_DEBUG_OBJECT (render,
-      "Processing subtitles with running time %" GST_TIME_FORMAT
-      " and duration %" GST_TIME_FORMAT, GST_TIME_ARGS (running_time),
-      GST_TIME_ARGS (duration));
+  if (gst_buffer_map (buffer, &map, GST_MAP_READ)) {
+    g_mutex_lock (&render->ass_mutex);
+    if (GST_BUFFER_PTS_IS_VALID (buffer) &&
+        GST_BUFFER_DURATION_IS_VALID (buffer)) {
+      pts_start = GST_BUFFER_PTS (buffer);
+      pts_start /= GST_MSECOND;
+      pts_end = GST_BUFFER_PTS (buffer) + GST_BUFFER_DURATION (buffer);
+      pts_end /= GST_MSECOND;
 
-  gst_buffer_map (buffer, &map, GST_MAP_READ);
-
-  g_mutex_lock (&render->ass_mutex);
-  ass_process_chunk (render->ass_track, (gchar *) map.data, map.size,
-      pts_start, pts_end);
-  g_mutex_unlock (&render->ass_mutex);
-
-  gst_buffer_unmap (buffer, &map);
+      ass_process_chunk (render->ass_track, (gchar *) map.data, map.size,
+          pts_start, pts_end);
+    } else {
+      ass_process_data (render->ass_track, (gchar *) map.data, map.size);
+    }
+    g_mutex_unlock (&render->ass_mutex);
+    gst_buffer_unmap (buffer, &map);
+  }
 }
 
 static GstVideoOverlayComposition *
@@ -846,6 +810,7 @@ gst_ass_render_chain_video (GstPad * pad, GstObject * parent,
   GstAssRender *render = GST_ASS_RENDER (parent);
   GstFlowReturn ret = GST_FLOW_OK;
   gboolean in_seg = FALSE;
+  gboolean enabled;
   guint64 start, stop, clip_start = 0, clip_stop = 0;
   ASS_Image *ass_image;
 
@@ -897,8 +862,6 @@ gst_ass_render_chain_video (GstPad * pad, GstObject * parent,
     }
   }
 
-wait_for_text_buf:
-
   GST_ASS_RENDER_LOCK (render);
 
   if (render->video_flushing)
@@ -907,153 +870,39 @@ wait_for_text_buf:
   if (render->video_eos)
     goto have_eos;
 
-  if (render->renderer_init_ok && render->track_init_ok && render->enable) {
-    /* Text pad linked, check if we have a text buffer queued */
-    if (render->subtitle_pending) {
-      GstClockTime text_start = GST_CLOCK_TIME_NONE;
-      GstClockTime text_end = GST_CLOCK_TIME_NONE;
-      GstClockTime text_running_time = GST_CLOCK_TIME_NONE;
-      GstClockTime text_running_time_end = GST_CLOCK_TIME_NONE;
-      GstClockTime vid_running_time, vid_running_time_end;
-      gdouble timestamp;
-      gint changed = 0;
+  enabled = render->renderer_init_ok && render->track_init_ok && render->enable;
 
-      /* if the text buffer isn't stamped right, pop it off the
-       * queue and display it for the current video frame only */
-      if (!GST_BUFFER_TIMESTAMP_IS_VALID (render->subtitle_pending) ||
-          !GST_BUFFER_DURATION_IS_VALID (render->subtitle_pending)) {
-        GST_WARNING_OBJECT (render,
-            "Got text buffer with invalid timestamp or duration");
-        gst_ass_render_pop_text (render);
-        GST_ASS_RENDER_UNLOCK (render);
-        goto wait_for_text_buf;
-      }
+  GST_ASS_RENDER_UNLOCK (render);
 
-      text_start = GST_BUFFER_TIMESTAMP (render->subtitle_pending);
-      text_end = text_start + GST_BUFFER_DURATION (render->subtitle_pending);
+  if (enabled) {
+    gdouble timestamp;
+    gint changed = 0;
 
-      vid_running_time =
-          gst_segment_to_running_time (&render->video_segment, GST_FORMAT_TIME,
-          start);
-      vid_running_time_end =
-          gst_segment_to_running_time (&render->video_segment, GST_FORMAT_TIME,
-          stop);
+    /* libass needs timestamps in ms */
+    timestamp = GST_BUFFER_TIMESTAMP (buffer) / GST_MSECOND;
 
-      /* If timestamp and duration are valid */
-      text_running_time =
-          gst_segment_to_running_time (&render->video_segment,
-          GST_FORMAT_TIME, text_start);
-      text_running_time_end =
-          gst_segment_to_running_time (&render->video_segment,
-          GST_FORMAT_TIME, text_end);
+    g_mutex_lock (&render->ass_mutex);
+    ass_image = ass_render_frame (render->ass_renderer, render->ass_track,
+        timestamp, &changed);
+    g_mutex_unlock (&render->ass_mutex);
 
-      GST_LOG_OBJECT (render, "T: %" GST_TIME_FORMAT " - %" GST_TIME_FORMAT,
-          GST_TIME_ARGS (text_running_time),
-          GST_TIME_ARGS (text_running_time_end));
-      GST_LOG_OBJECT (render, "V: %" GST_TIME_FORMAT " - %" GST_TIME_FORMAT,
-          GST_TIME_ARGS (vid_running_time),
-          GST_TIME_ARGS (vid_running_time_end));
-
-      /* Text too old */
-      if (text_running_time_end <= vid_running_time) {
-        GST_DEBUG_OBJECT (render, "text buffer too old, popping");
-        gst_ass_render_pop_text (render);
-        GST_ASS_RENDER_UNLOCK (render);
-        goto wait_for_text_buf;
-      }
-
-      if (render->need_process) {
-        GST_DEBUG_OBJECT (render, "process text buffer");
-        gst_ass_render_process_text (render, render->subtitle_pending,
-            text_running_time, text_running_time_end - text_running_time);
-        render->need_process = FALSE;
-      }
-
-      GST_ASS_RENDER_UNLOCK (render);
-
-      /* libass needs timestamps in ms */
-      timestamp = vid_running_time / GST_MSECOND;
-
-      g_mutex_lock (&render->ass_mutex);
-      ass_image = ass_render_frame (render->ass_renderer, render->ass_track,
-          timestamp, &changed);
-      g_mutex_unlock (&render->ass_mutex);
-
-      if ((!ass_image || changed) && render->composition) {
-        GST_DEBUG_OBJECT (render, "release overlay (changed %d)", changed);
-        gst_video_overlay_composition_unref (render->composition);
-        render->composition = NULL;
-      }
-
-      if (ass_image != NULL) {
-        if (!render->composition)
-          render->composition = gst_ass_render_composite_overlay (render,
-              ass_image);
-      } else {
-        GST_DEBUG_OBJECT (render, "nothing to render right now");
-      }
-
-      /* Push the video frame */
-      ret = gst_ass_render_push_frame (render, buffer);
-
-      if (text_running_time_end <= vid_running_time_end) {
-        GST_ASS_RENDER_LOCK (render);
-        gst_ass_render_pop_text (render);
-        GST_ASS_RENDER_UNLOCK (render);
-      }
-    } else {
-      gboolean wait_for_text_buf = TRUE;
-
-      if (render->subtitle_eos)
-        wait_for_text_buf = FALSE;
-
-      if (!render->wait_text)
-        wait_for_text_buf = FALSE;
-
-      /* Text pad linked, but no text buffer available - what now? */
-      if (render->subtitle_segment.format == GST_FORMAT_TIME) {
-        GstClockTime text_start_running_time, text_last_stop_running_time;
-        GstClockTime vid_running_time;
-
-        vid_running_time =
-            gst_segment_to_running_time (&render->video_segment,
-            GST_FORMAT_TIME, GST_BUFFER_TIMESTAMP (buffer));
-        text_start_running_time =
-            gst_segment_to_running_time (&render->subtitle_segment,
-            GST_FORMAT_TIME, render->subtitle_segment.start);
-        text_last_stop_running_time =
-            gst_segment_to_running_time (&render->subtitle_segment,
-            GST_FORMAT_TIME, render->subtitle_segment.position);
-
-        if ((GST_CLOCK_TIME_IS_VALID (text_start_running_time) &&
-                vid_running_time < text_start_running_time) ||
-            (GST_CLOCK_TIME_IS_VALID (text_last_stop_running_time) &&
-                vid_running_time < text_last_stop_running_time)) {
-          wait_for_text_buf = FALSE;
-        }
-      }
-
-      if (wait_for_text_buf) {
-        GST_DEBUG_OBJECT (render, "no text buffer, need to wait for one");
-        GST_ASS_RENDER_WAIT (render);
-        GST_DEBUG_OBJECT (render, "resuming");
-        GST_ASS_RENDER_UNLOCK (render);
-        goto wait_for_text_buf;
-      } else {
-        GST_ASS_RENDER_UNLOCK (render);
-        GST_LOG_OBJECT (render, "no need to wait for a text buffer");
-        ret = gst_pad_push (render->srcpad, buffer);
-      }
+    if ((!ass_image || changed) && render->composition) {
+      GST_DEBUG_OBJECT (render, "release overlay (changed %d)", changed);
+      gst_video_overlay_composition_unref (render->composition);
+      render->composition = NULL;
     }
-  } else {
-    GST_LOG_OBJECT (render, "rendering disabled, doing buffer passthrough");
 
-    GST_ASS_RENDER_UNLOCK (render);
-    ret = gst_pad_push (render->srcpad, buffer);
-    return ret;
+    if (ass_image != NULL) {
+      if (!render->composition)
+        render->composition = gst_ass_render_composite_overlay (render,
+            ass_image);
+    } else {
+      GST_DEBUG_OBJECT (render, "nothing to render right now");
+    }
   }
 
-  GST_DEBUG_OBJECT (render, "leaving chain for buffer %p ret=%d", buffer, ret);
+  /* Push the video frame */
+  ret = gst_ass_render_push_frame (render, buffer);
 
   /* Update last_stop */
   render->video_segment.position = clip_start;
@@ -1096,8 +945,6 @@ gst_ass_render_chain_text (GstPad * pad, GstObject * parent, GstBuffer * buffer)
   gboolean in_seg = FALSE;
   guint64 clip_start = 0, clip_stop = 0;
 
-  GST_DEBUG_OBJECT (render, "entering chain for buffer %p", buffer);
-
   GST_ASS_RENDER_LOCK (render);
 
   if (render->subtitle_flushing) {
@@ -1134,45 +981,15 @@ gst_ass_render_chain_text (GstPad * pad, GstObject * parent, GstBuffer * buffer)
     else if (GST_BUFFER_DURATION_IS_VALID (buffer))
       GST_BUFFER_DURATION (buffer) = clip_stop - clip_start;
 
-    if (render->subtitle_pending
-        && (!GST_BUFFER_TIMESTAMP_IS_VALID (render->subtitle_pending)
-            || !GST_BUFFER_DURATION_IS_VALID (render->subtitle_pending))) {
-      gst_buffer_unref (render->subtitle_pending);
-      render->subtitle_pending = NULL;
-      GST_ASS_RENDER_BROADCAST (render);
-    } else {
-      /* Wait for the previous buffer to go away */
-      while (render->subtitle_pending != NULL) {
-        GST_DEBUG ("Pad %s:%s has a buffer queued, waiting",
-            GST_DEBUG_PAD_NAME (pad));
-        GST_ASS_RENDER_WAIT (render);
-        GST_DEBUG ("Pad %s:%s resuming", GST_DEBUG_PAD_NAME (pad));
-        if (render->subtitle_flushing) {
-          GST_ASS_RENDER_UNLOCK (render);
-          ret = GST_FLOW_FLUSHING;
-          goto beach;
-        }
-      }
-    }
-
     if (GST_BUFFER_TIMESTAMP_IS_VALID (buffer))
       render->subtitle_segment.position = clip_start;
 
-    GST_DEBUG_OBJECT (render,
-        "New buffer arrived for timestamp %" GST_TIME_FORMAT,
-        GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buffer)));
-    render->subtitle_pending = gst_buffer_ref (buffer);
-    render->need_process = TRUE;
-
-    /* in case the video chain is waiting for a text buffer, wake it up */
-    GST_ASS_RENDER_BROADCAST (render);
+    gst_ass_render_process_text (render, buffer);
   }
 
   GST_ASS_RENDER_UNLOCK (render);
 
 beach:
-  GST_DEBUG_OBJECT (render, "leaving chain for buffer %p", buffer);
-
   gst_buffer_unref (buffer);
   return ret;
 }
@@ -1319,7 +1136,6 @@ gst_ass_render_event_video (GstPad * pad, GstObject * parent, GstEvent * event)
       GST_ASS_RENDER_LOCK (render);
       GST_INFO_OBJECT (render, "video flush start");
       render->video_flushing = TRUE;
-      GST_ASS_RENDER_BROADCAST (render);
       GST_ASS_RENDER_UNLOCK (render);
       ret = gst_pad_event_default (pad, parent, event);
       break;
@@ -1408,14 +1224,10 @@ gst_ass_render_event_text (GstPad * pad, GstObject * parent, GstEvent * event)
         GST_ELEMENT_WARNING (render, STREAM, MUX, (NULL),
             ("received non-TIME newsegment event on subtitle input"));
       }
+      GST_ASS_RENDER_UNLOCK (render);
 
       gst_event_unref (event);
       ret = TRUE;
-
-      /* wake up the video chain, it might be waiting for a text buffer or
-       * a text segment update */
-      GST_ASS_RENDER_BROADCAST (render);
-      GST_ASS_RENDER_UNLOCK (render);
       break;
     }
     case GST_EVENT_GAP:{
@@ -1428,10 +1240,6 @@ gst_ass_render_event_text (GstPad * pad, GstObject * parent, GstEvent * event)
        * so that is our position now */
       GST_ASS_RENDER_LOCK (render);
       render->subtitle_segment.position = start;
-
-      /* wake up the video chain, it might be waiting for a text buffer or
-       * a text segment update */
-      GST_ASS_RENDER_BROADCAST (render);
       GST_ASS_RENDER_UNLOCK (render);
       break;
     }
@@ -1440,7 +1248,6 @@ gst_ass_render_event_text (GstPad * pad, GstObject * parent, GstEvent * event)
       GST_INFO_OBJECT (render, "text flush stop");
       render->subtitle_flushing = FALSE;
       render->subtitle_eos = FALSE;
-      gst_ass_render_pop_text (render);
       gst_segment_init (&render->subtitle_segment, GST_FORMAT_TIME);
       GST_ASS_RENDER_UNLOCK (render);
       gst_event_unref (event);
@@ -1461,18 +1268,14 @@ gst_ass_render_event_text (GstPad * pad, GstObject * parent, GstEvent * event)
       g_mutex_unlock (&render->ass_mutex);
       GST_ASS_RENDER_LOCK (render);
       render->subtitle_flushing = TRUE;
-      GST_ASS_RENDER_BROADCAST (render);
       GST_ASS_RENDER_UNLOCK (render);
       gst_event_unref (event);
       ret = TRUE;
       break;
     case GST_EVENT_EOS:
+      GST_INFO_OBJECT (render, "text EOS");
       GST_ASS_RENDER_LOCK (render);
       render->subtitle_eos = TRUE;
-      GST_INFO_OBJECT (render, "text EOS");
-      /* wake up the video chain, it might be waiting for a text buffer or
-       * a text segment update */
-      GST_ASS_RENDER_BROADCAST (render);
       GST_ASS_RENDER_UNLOCK (render);
       gst_event_unref (event);
       ret = TRUE;

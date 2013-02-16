@@ -53,11 +53,9 @@ struct _GstAssRender
 
   /* properties */
   gboolean enable, embeddedfonts;
-  gboolean wait_text;
 
   /* <private> */
   GMutex lock;
-  GCond cond;
 
   GstSegment video_segment;
   gboolean video_flushing;
@@ -65,7 +63,6 @@ struct _GstAssRender
 
   GstVideoInfo info;
 
-  GstBuffer *subtitle_pending;
   gboolean subtitle_flushing;
   gboolean subtitle_eos;
   GstSegment subtitle_segment;
@@ -76,7 +73,6 @@ struct _GstAssRender
   ASS_Track *ass_track;
 
   gboolean renderer_init_ok, track_init_ok;
-  gboolean need_process;
 
   /* overlay stuff */
   GstVideoOverlayComposition *composition;

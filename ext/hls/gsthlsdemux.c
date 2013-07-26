@@ -115,7 +115,7 @@ static gboolean gst_hls_demux_update_playlist (GstHLSDemux * demux,
 static void gst_hls_demux_reset (GstHLSDemux * demux, gboolean dispose);
 static gboolean gst_hls_demux_set_location (GstHLSDemux * demux,
     const gchar * uri);
-static gchar *gst_hls_src_buf_to_utf8_playlist (GstBuffer * buf);
+static gchar *gst_hls_src_fragment_to_utf8_playlist (GstFragment * fragment);
 
 #define gst_hls_demux_parent_class parent_class
 G_DEFINE_TYPE (GstHLSDemux, gst_hls_demux, GST_TYPE_ELEMENT);
@@ -480,7 +480,9 @@ gst_hls_demux_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
       }
       gst_query_unref (query);
 
-      playlist = gst_hls_src_buf_to_utf8_playlist (demux->playlist);
+      demux->playlist->completed = TRUE;
+      playlist = gst_hls_src_fragment_to_utf8_playlist (demux->playlist);
+      g_object_unref (demux->playlist);
       demux->playlist = NULL;
       if (playlist == NULL) {
         GST_WARNING_OBJECT (demux, "Error validating first playlist.");
@@ -589,9 +591,9 @@ gst_hls_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   GstHLSDemux *demux = GST_HLS_DEMUX (parent);
 
   if (demux->playlist == NULL)
-    demux->playlist = buf;
-  else
-    demux->playlist = gst_buffer_append (demux->playlist, buf);
+    demux->playlist = gst_fragment_new ();
+
+  gst_fragment_add_buffer (demux->playlist, buf);
 
   return GST_FLOW_OK;
 }
@@ -698,6 +700,7 @@ static void
 gst_hls_demux_stream_loop (GstHLSDemux * demux)
 {
   GstFragment *fragment;
+  GstBufferList *buffer_list;
   GstBuffer *buf;
   GstFlowReturn ret;
   GstCaps *bufcaps, *srccaps = NULL;
@@ -726,7 +729,8 @@ gst_hls_demux_stream_loop (GstHLSDemux * demux)
   }
 
   fragment = g_queue_pop_head (demux->queue);
-  buf = gst_fragment_get_buffer (fragment);
+  buffer_list = gst_fragment_get_buffer_list (fragment);
+  buf = gst_buffer_list_get (buffer_list, 0);
 
   /* Figure out if we need to create/switch pads */
   if (G_LIKELY (demux->srcpad))
@@ -758,13 +762,13 @@ gst_hls_demux_stream_loop (GstHLSDemux * demux)
     demux->position_shift = 0;
   }
 
-  GST_DEBUG_OBJECT (demux, "Pushing buffer %p", buf);
+  GST_DEBUG_OBJECT (demux, "Pushing buffer list %p", buffer_list);
 
-  ret = gst_pad_push (demux->srcpad, buf);
+  ret = gst_pad_push_list (demux->srcpad, buffer_list);
   if (ret != GST_FLOW_OK)
     goto error_pushing;
 
-  GST_DEBUG_OBJECT (demux, "Pushed buffer");
+  GST_DEBUG_OBJECT (demux, "Pushed buffer list");
 
   return;
 
@@ -823,7 +827,7 @@ gst_hls_demux_reset (GstHLSDemux * demux, gboolean dispose)
   }
 
   if (demux->playlist) {
-    gst_buffer_unref (demux->playlist);
+    g_object_unref (demux->playlist);
     demux->playlist = NULL;
   }
 
@@ -1034,37 +1038,33 @@ gst_hls_demux_cache_fragments (GstHLSDemux * demux)
 }
 
 static gchar *
-gst_hls_src_buf_to_utf8_playlist (GstBuffer * buf)
+gst_hls_src_fragment_to_utf8_playlist (GstFragment * fragment)
 {
-  GstMapInfo info;
   gchar *playlist;
+  gsize size;
 
-  if (!gst_buffer_map (buf, &info, GST_MAP_READ))
-    goto map_error;
+  size = gst_fragment_get_size (fragment);
 
-  if (!g_utf8_validate ((gchar *) info.data, info.size, NULL))
-    goto validate_error;
+  playlist = g_malloc (size + 1);
+  if (!playlist)
+    return NULL;
 
-  /* alloc size + 1 to end with a null character */
-  playlist = g_malloc0 (info.size + 1);
-  memcpy (playlist, info.data, info.size);
+  size = gst_fragment_extract (fragment, 0, playlist, size);
 
-  gst_buffer_unmap (buf, &info);
-  gst_buffer_unref (buf);
+  playlist[size] = '\0';
+
+  if (!g_utf8_validate (playlist, size, NULL)) {
+    g_free (playlist);
+    return NULL;
+  }
+
   return playlist;
-
-validate_error:
-  gst_buffer_unmap (buf, &info);
-map_error:
-  gst_buffer_unref (buf);
-  return NULL;
 }
 
 static gboolean
 gst_hls_demux_update_playlist (GstHLSDemux * demux, gboolean update)
 {
   GstFragment *download;
-  GstBuffer *buf;
   gchar *playlist;
   gboolean updated = FALSE;
 
@@ -1075,8 +1075,7 @@ gst_hls_demux_update_playlist (GstHLSDemux * demux, gboolean update)
   if (download == NULL)
     return FALSE;
 
-  buf = gst_fragment_get_buffer (download);
-  playlist = gst_hls_src_buf_to_utf8_playlist (buf);
+  playlist = gst_hls_src_fragment_to_utf8_playlist (download);
   g_object_unref (download);
 
   if (playlist == NULL) {
@@ -1215,7 +1214,6 @@ gst_hls_demux_switch_playlist (GstHLSDemux * demux)
   gsize size;
   gint bitrate;
   GstFragment *fragment;
-  GstBuffer *buffer;
 
   GST_M3U8_CLIENT_LOCK (demux->client);
   fragment = g_queue_peek_tail (demux->queue);
@@ -1229,73 +1227,89 @@ gst_hls_demux_switch_playlist (GstHLSDemux * demux)
    * scheduled */
   g_get_current_time (&now);
   diff = (GST_TIMEVAL_TO_TIME (now) - GST_TIMEVAL_TO_TIME (demux->next_update));
-  buffer = gst_fragment_get_buffer (fragment);
-  size = gst_buffer_get_size (buffer);
+  size = gst_fragment_get_size (fragment);
   bitrate = (size * 8) / ((double) diff / GST_SECOND);
 
   GST_DEBUG ("Downloaded %d bytes in %" GST_TIME_FORMAT ". Bitrate is : %d",
       (guint) size, GST_TIME_ARGS (diff), bitrate);
 
-  gst_buffer_unref (buffer);
   return gst_hls_demux_change_playlist (demux, bitrate * demux->bitrate_limit);
+}
+
+static gboolean
+gst_hls_demux_decrypt_buffer (GstHLSDemux * demux, GstBuffer * buffer,
+    const guint8 * key, const guint8 * iv)
+{
+  gnutls_cipher_hd_t aes_ctx;
+  gnutls_datum_t key_d, iv_d;
+  GstMapInfo map;
+
+  key_d.data = (unsigned char *) key;
+  key_d.size = 16;
+  iv_d.data = (unsigned char *) iv;
+  iv_d.size = 16;
+
+  if (!gst_buffer_map (buffer, &map, GST_MAP_READWRITE))
+    return FALSE;
+
+  GST_DEBUG_OBJECT (demux, "decrypt %" G_GSIZE_FORMAT " bytes buffer",
+      map.size);
+
+  gnutls_cipher_init (&aes_ctx, GNUTLS_CIPHER_AES_128_CBC, &key_d, &iv_d);
+  if (gnutls_cipher_decrypt (aes_ctx, map.data, map.size))
+    GST_WARNING_OBJECT (demux, "failed to decrypt %" G_GSIZE_FORMAT
+        " bytes buffer", map.size);
+  gnutls_cipher_deinit (aes_ctx);
+
+  if (map.size > 0) {
+    /* Handle pkcs7 unpadding here */
+    gsize unpadded_size = map.size - map.data[map.size - 1];
+    gst_buffer_resize (buffer, 0, unpadded_size);
+  }
+
+  gst_buffer_unmap (buffer, &map);
+
+  return TRUE;
 }
 
 static GstFragment *
 gst_hls_demux_decrypt_fragment (GstHLSDemux * demux,
-    GstFragment * encrypted_fragment, const gchar * key, const guint8 * iv)
+    GstFragment * fragment, const gchar * key_uri, const guint8 * iv)
 {
-  GstFragment *key_fragment, *ret = NULL;
-  GstBuffer *key_buffer, *encrypted_buffer, *decrypted_buffer;
-  GstMapInfo key_info, encrypted_info, decrypted_info;
-  gnutls_cipher_hd_t aes_ctx;
-  gnutls_datum_t key_d, iv_d;
-  gsize unpadded_size;
+  GstFragment *key_fragment;
+  guint8 key[16];
+  guint key_size;
+  GstBuffer *buffer;
 
-  GST_INFO_OBJECT (demux, "Fetching key %s", key);
-  key_fragment = gst_uri_downloader_fetch_uri (demux->downloader, key);
+  GST_INFO_OBJECT (demux, "Fetching key %s", key_uri);
+  key_fragment = gst_uri_downloader_fetch_uri (demux->downloader, key_uri);
   if (key_fragment == NULL)
-    goto key_failed;
+    return NULL;
 
-  key_buffer = gst_fragment_get_buffer (key_fragment);
-  encrypted_buffer = gst_fragment_get_buffer (encrypted_fragment);
-  decrypted_buffer =
-      gst_buffer_new_allocate (NULL, gst_buffer_get_size (encrypted_buffer),
-      NULL);
-
-  gst_buffer_map (key_buffer, &key_info, GST_MAP_READ);
-  gst_buffer_map (encrypted_buffer, &encrypted_info, GST_MAP_READ);
-  gst_buffer_map (decrypted_buffer, &decrypted_info, GST_MAP_WRITE);
-
-  key_d.data = key_info.data;
-  key_d.size = 16;
-  iv_d.data = (unsigned char *) iv;
-  iv_d.size = 16;
-  gnutls_cipher_init (&aes_ctx, gnutls_cipher_get_id ("AES-128-CBC"), &key_d,
-      &iv_d);
-  gnutls_cipher_decrypt2 (aes_ctx, encrypted_info.data, encrypted_info.size,
-      decrypted_info.data, decrypted_info.size);
-  gnutls_cipher_deinit (aes_ctx);
-
-  /* Handle pkcs7 unpadding here */
-  unpadded_size =
-      decrypted_info.size - decrypted_info.data[decrypted_info.size - 1];
-
-  gst_buffer_unmap (decrypted_buffer, &decrypted_info);
-  gst_buffer_unmap (encrypted_buffer, &encrypted_info);
-  gst_buffer_unmap (key_buffer, &key_info);
-
-  gst_buffer_resize (decrypted_buffer, 0, unpadded_size);
-
-  gst_buffer_unref (key_buffer);
-  gst_buffer_unref (encrypted_buffer);
+  key_size = gst_fragment_extract (key_fragment, 0, key, 16);
   g_object_unref (key_fragment);
 
-  ret = gst_fragment_new ();
-  gst_fragment_add_buffer (ret, decrypted_buffer);
-  ret->completed = TRUE;
-key_failed:
-  g_object_unref (encrypted_fragment);
-  return ret;
+  if (key_size != 16) {
+    GST_ERROR_OBJECT (demux, "invalid AES key size %u", key_size);
+    return NULL;
+  }
+
+  buffer = gst_fragment_get_buffer (fragment);
+  if (!buffer)
+    return NULL;
+
+  g_object_unref (fragment);
+
+  if (!gst_hls_demux_decrypt_buffer (demux, buffer, key, iv)) {
+    gst_buffer_unref (buffer);
+    return NULL;
+  }
+
+  fragment = gst_fragment_new ();
+  gst_fragment_add_buffer (fragment, buffer);
+  fragment->completed = TRUE;
+
+  return fragment;
 }
 
 static gboolean
@@ -1305,6 +1319,7 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux, gboolean caching)
   const gchar *next_fragment_uri;
   GstClockTime duration;
   GstClockTime timestamp;
+  GstBufferList *buffer_list;
   GstBuffer *buf;
   gboolean discont;
   const gchar *key = NULL;
@@ -1329,7 +1344,9 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux, gboolean caching)
   if (download == NULL)
     goto error;
 
-  buf = gst_fragment_get_buffer (download);
+  buffer_list = gst_fragment_get_buffer_list (download);
+  buf = gst_buffer_list_get (buffer_list, 0);
+  gst_buffer_list_unref (buffer_list);
 
   GST_BUFFER_DURATION (buf) = duration;
   GST_BUFFER_PTS (buf) = timestamp;
@@ -1354,9 +1371,6 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux, gboolean caching)
     GST_DEBUG_OBJECT (demux, "Marking fragment as discontinuous");
     GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
   }
-
-  /* The buffer ref is still kept inside the fragment download */
-  gst_buffer_unref (buf);
 
   GST_DEBUG_OBJECT (demux, "Pushing fragment in queue");
   g_queue_push_tail (demux->queue, download);

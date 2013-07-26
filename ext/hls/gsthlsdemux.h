@@ -61,7 +61,7 @@ struct _GstHLSDemux
   gboolean have_group_id;
   guint group_id;
 
-  GstBuffer *playlist;
+  GstFragment *playlist;
   GstCaps *input_caps;
   GstUriDownloader *downloader;
   GstM3U8Client *client;        /* M3U8 client */

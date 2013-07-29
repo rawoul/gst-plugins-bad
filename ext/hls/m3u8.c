@@ -149,28 +149,13 @@ static gboolean
 double_from_string (gchar * ptr, gchar ** endptr, gdouble * val)
 {
   gchar *end;
-  gdouble ret;
 
-  g_return_val_if_fail (ptr != NULL, FALSE);
-  g_return_val_if_fail (val != NULL, FALSE);
-
-  errno = 0;
-  ret = strtod (ptr, &end);
-  if ((errno == ERANGE && (ret == HUGE_VAL || ret == -HUGE_VAL))
-      || (errno != 0 && ret == 0)) {
-    GST_WARNING ("%s", g_strerror (errno));
-    return FALSE;
-  }
-
-  if (!isfinite (ret)) {
-    GST_WARNING ("%s", g_strerror (ERANGE));
-    return FALSE;
-  }
-
+  *val = g_ascii_strtod (ptr, &end);
   if (endptr)
     *endptr = end;
 
-  *val = (gint) ret;
+  if (errno != 0)
+    return FALSE;
 
   return end != ptr;
 }

@@ -1355,14 +1355,16 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux, gboolean caching)
   if (G_UNLIKELY (demux->do_typefind)) {
     GstCaps *caps = gst_fragment_get_caps (download);
 
-    if (!demux->input_caps || !gst_caps_is_equal (caps, demux->input_caps)) {
-      gst_caps_replace (&demux->input_caps, caps);
-      /* gst_pad_set_caps (demux->srcpad, demux->input_caps); */
-      GST_INFO_OBJECT (demux, "Input source caps: %" GST_PTR_FORMAT,
-          demux->input_caps);
-      demux->do_typefind = FALSE;
+    if (caps) {
+      if (!demux->input_caps || !gst_caps_is_equal (caps, demux->input_caps)) {
+        gst_caps_replace (&demux->input_caps, caps);
+        /* gst_pad_set_caps (demux->srcpad, demux->input_caps); */
+        GST_INFO_OBJECT (demux, "Input source caps: %" GST_PTR_FORMAT,
+            demux->input_caps);
+        demux->do_typefind = FALSE;
+      }
+      gst_caps_unref (caps);
     }
-    gst_caps_unref (caps);
   } else {
     gst_fragment_set_caps (download, demux->input_caps);
   }

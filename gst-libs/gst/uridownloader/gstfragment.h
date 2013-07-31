@@ -61,10 +61,14 @@ struct _GstFragmentClass
 GType gst_fragment_get_type (void);
 
 GstBuffer * gst_fragment_get_buffer (GstFragment *fragment);
+GstBufferList * gst_fragment_get_buffer_list (GstFragment *fragment);
+gsize gst_fragment_get_size (GstFragment *fragment);
 void gst_fragment_set_caps (GstFragment * fragment, GstCaps * caps);
 GstCaps * gst_fragment_get_caps (GstFragment * fragment);
 gboolean gst_fragment_add_buffer (GstFragment *fragment, GstBuffer *buffer);
 GstFragment * gst_fragment_new (void);
+gsize gst_fragment_extract (GstFragment * fragment, gsize offset, gpointer dest,
+    gsize size);
 
 G_END_DECLS
 #endif /* __GSTFRAGMENT_H__ */

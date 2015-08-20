@@ -41,6 +41,9 @@
 
 #include <string.h>
 
+#define MAX_RENDER_WIDTH 1280
+#define MAX_RENDER_HEIGHT 720
+
 GST_DEBUG_CATEGORY_STATIC (gst_ass_render_debug);
 GST_DEBUG_CATEGORY_STATIC (gst_ass_render_lib_debug);
 #define GST_CAT_DEFAULT gst_ass_render_debug
@@ -751,6 +754,8 @@ gst_ass_render_can_handle_caps (GstCaps * incaps)
 static void
 gst_ass_render_update_render_size (GstAssRender * render)
 {
+  guint frame_width, frame_height;
+
   gdouble video_aspect = (gdouble) render->info.width /
       (gdouble) render->info.height;
   gdouble window_aspect = (gdouble) render->window_width /
@@ -758,12 +763,29 @@ gst_ass_render_update_render_size (GstAssRender * render)
 
   /* render at the window size, with the video aspect ratio */
   if (video_aspect >= window_aspect) {
-    render->ass_frame_width = render->window_width;
-    render->ass_frame_height = render->window_width / video_aspect;
+    frame_width = render->window_width;
+    frame_height = render->window_width / video_aspect;
   } else {
-    render->ass_frame_width = render->window_height * video_aspect;
-    render->ass_frame_height = render->window_height;
+    frame_width = render->window_height * video_aspect;
+    frame_height = render->window_height;
   }
+
+  /* cap the render size to some harcoded limits to avoid slowdowns */
+  if (frame_width > MAX_RENDER_WIDTH || frame_height > MAX_RENDER_HEIGHT) {
+    gdouble max_aspect = (gdouble) MAX_RENDER_WIDTH /
+        (gdouble) MAX_RENDER_HEIGHT;
+
+    if (video_aspect >= max_aspect) {
+      frame_width = MAX_RENDER_WIDTH;
+      frame_height = MAX_RENDER_WIDTH / video_aspect;
+    } else {
+      frame_width = MAX_RENDER_HEIGHT * video_aspect;
+      frame_height = MAX_RENDER_HEIGHT;
+    }
+  }
+
+  render->ass_frame_width = frame_width;
+  render->ass_frame_height = frame_height;
 }
 
 static gboolean

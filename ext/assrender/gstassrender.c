@@ -1095,12 +1095,14 @@ gst_ass_render_composite_overlay (GstAssRender * render, ASS_Image * images)
       -min_x, -min_y);
   gst_video_meta_unmap (vmeta, 0, &map);
 
+  rectangle = gst_video_overlay_rectangle_new_raw (buffer, 0, 0, 1, 1,
+      GST_VIDEO_OVERLAY_FORMAT_FLAG_PREMULTIPLIED_ALPHA);
+
   hscale = (gdouble) render->info.width / (gdouble) render->ass_frame_width;
   vscale = (gdouble) render->info.height / (gdouble) render->ass_frame_height;
 
-  rectangle = gst_video_overlay_rectangle_new_raw (buffer,
-      hscale * min_x, vscale * min_y, hscale * width, vscale * height,
-      GST_VIDEO_OVERLAY_FORMAT_FLAG_PREMULTIPLIED_ALPHA);
+  gst_video_overlay_rectangle_set_render_geometry (rectangle,
+      hscale * min_x, vscale * min_y, hscale * width, vscale * height);
 
   gst_buffer_unref (buffer);
 
